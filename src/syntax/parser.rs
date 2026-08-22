@@ -1,4 +1,3 @@
-use std::ptr::null;
 use crate::runtime::error::{SyntaxError, SyntaxErrorType};
 use crate::syntax::node::{Expression, ExpressionType, Statement, StatementType, PRIMITIVES};
 use crate::syntax::token::{Token, TokenData};
@@ -364,25 +363,25 @@ impl Parser {
     }
     fn parse_type(&mut self) -> Result<Type, SyntaxError> {
         let first = self.expect_literal()?;
-        let mut ty: Option<Type> = None;
+        let ty: Type;
         if let Some(typ) = PRIMITIVES.get(&first) {
-            ty = Some(typ.clone());
+            ty = typ.clone();
         } else {
             match first.as_str() {
                 "array" => {
                     self.expect(TokenData::BracketLeft)?;
-                    if let TokenData::Literal(ref s) = self.peek()?.token_data {
+                    if let TokenData::Literal(_) = self.peek()?.token_data {
                         let arr_ty = self.parse_type()?;
-                        ty = Some(Type::Array(Box::new(arr_ty)));
+                        ty = Type::Array(Box::new(arr_ty));
                     } else {
-                        ty = Some(Type::Array(Box::new(Type::Any)));
+                        ty = Type::Array(Box::new(Type::Any));
                     }
                     self.expect(TokenData::BracketRight)?;
                 }
-                other=> ty = Some(Type::Unresolved(other.to_string())),
+                other=> ty = Type::Unresolved(other.to_string()),
             }
         }
-        Ok(ty.unwrap())
+        Ok(ty)
     }
     fn parse_function(&mut self) -> Result<Statement, SyntaxError> {
         let start = self.advance(); // consume proc, to name
@@ -417,7 +416,7 @@ impl Parser {
         let mut rtn = Type::Any;
         if self.peek()?.token_data == TokenData::Arrow {
             self.advance();
-            rtn = self.parse_type()?;;
+            rtn = self.parse_type()?;
         }
         self.expect(TokenData::OpenBody)?;
         let mut body = Vec::new();

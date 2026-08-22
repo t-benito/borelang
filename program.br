@@ -45,6 +45,30 @@ if PIE == 3.5 ?? 1 == 1 {
 let val1: int = math.abs(-512)
 let val2: float = math.abs(-83.19)
 println("Abs of -512 is ", val1, ", abs of -83.19 is ", val2)
+let arr: array[] = [[1, 2], "Hello, world!"]
+println(arr[0])
 
-let arr: array[] = [1, "Hello, world!"]
-println(arr[1])
+#math.PI -= 3.to_float()
+println(math.PI)
+
+println("now we are getting to the age part") println() println() println() println() println()
+
+ask_age()
+
+fn ask_age() {
+    let age = input("How old are you? ")
+    if !(age.is_int()) {
+        println("Please enter a valid age.")
+        return ask_age()
+    }
+    age = age.to_int()
+
+    if age >= 18 && age < 75 {
+        println("You can drive!")
+        input("")
+        return null
+    } else {
+        println("You can't drive.")
+        return ask_age()
+    }
+}

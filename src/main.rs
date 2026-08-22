@@ -1,6 +1,6 @@
 #![feature(duration_millis_float)]
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{stdin, Read};
 
 use borelang::runtime::interpreter::Interpreter;
 use borelang::syntax::{lexer::Lexer, parser::Parser};
@@ -43,8 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let time_now = std::time::SystemTime::now();
     let dur = time_now.duration_since(time_start)?.as_millis_f64();
-    println!();
-    println!("total: {}", dur);
+    println!("\ntotal: {}", dur);
     println!("time lexer: {}", dur_lex);
     println!("time parser: {}", dur_parse);
     if let Some(dur_inter) = dur_inter {
@@ -52,5 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("interpreter crashed")
     }
+    let mut s = String::new();
+    stdin().read_line(&mut s).expect("");
     Ok(())
 }

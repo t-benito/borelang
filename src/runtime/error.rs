@@ -74,7 +74,8 @@ pub enum RuntimeErrorType {
     ModuleNotFound(String),
     ImportedModuleDoesntHaveInitFunction(String),
     ArrIndexOutOfBounds(i64, usize),
-    AttemptToIndexArrWithNonInteger(Value)
+    AttemptToIndexArrWithNonInteger(Value),
+    AttemptToChangeConstantField(String),
 }
 #[derive(Debug)]
 pub struct RuntimeError {
@@ -116,7 +117,7 @@ impl Display for RuntimeError {
                 write!(f, "\x1b[31mRuntime Error\x1b[0m: Expected '{}' ({}:{})", ty, self.line, self.column)
             },
             RuntimeErrorType::Other(ref s) => {
-                write!(f, "{} ({}:{})", s, self.line, self.column)
+                write!(f, "\x1b[31mRuntime Error\x1b[0m: {} ({}:{})", s, self.line, self.column)
             }
             RuntimeErrorType::FunctionShippedWithWrongAmountOfArgs(ref s, ref expected, ref got) => {
                 write!(f, "\x1b[31mRuntime Error\x1b[0m: Function '{}' expected {} arguments, but got {} ({}:{})", s, expected, got, self.line, self.column)
@@ -158,6 +159,9 @@ impl Display for RuntimeError {
             }
             RuntimeErrorType::AttemptToIndexArrWithNonInteger(ref nonint) => {
                 write!(f, "\x1b[31mRuntime Error\x1b[0m: Attempt to index array with non-integer value '{}' ({}:{})", nonint, self.line, self.column)
+            }
+            RuntimeErrorType::AttemptToChangeConstantField(ref object_name) => {
+                write!(f, "\x1b[31mRuntime Error\x1b[0m: Attempt to change constant property of object '{}' ({}:{})", object_name, self.line, self.column)
             }
         }
     }

@@ -2,9 +2,8 @@ use std::cell::RefCell;
 use std::cmp::PartialEq;
 use std::collections::HashMap;
 use std::env::{var};
-use std::fmt::{write, Display, Formatter};
+use std::fmt::{Display, Formatter};
 use std::fs::create_dir_all;
-use std::ops::Deref;
 use std::path::PathBuf;
 use std::rc::Rc;
 use libloading::{Library, Symbol};
@@ -13,11 +12,11 @@ use error::{RuntimeError, RuntimeErrorType};
 use crate::{primitive, Module};
 
 use crate::syntax::node::{Statement, StatementType, ExpressionType, Expression};
-use crate::syntax::token::TokenData;
+use crate::syntax::token::{Token, TokenData};
 
 type Env = Rc<RefCell<Environment>>;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Value {
     UInt(u128),
     Int(i64),
@@ -27,11 +26,14 @@ pub enum Value {
     Array(Rc<RefCell<Vec<(Value, Type)>>>),
     Object {
         name: String,
-        fields: Rc<RefCell<HashMap<String, Value>>>,
+        fields: Rc<RefCell<HashMap<String, Variable>>>,
     },
-    BoreFunction(Rc<Statement>),
+    BoreFunction {
+        stmt: Rc<Statement>,
+        enclosing: Env,
+    },
     RustFunction {
-        func: fn(args: Vec<Value>) -> Value,
+        func: fn(args: Vec<Value>) -> Result<Value, RuntimeErrorType>,
         params: Vec<Type>,
         ret_type: Type,
     },
@@ -101,7 +103,7 @@ impl Value {
                 }
             },
             Value::Object { name, .. } => Type::Class(name.clone()),
-            Value::BoreFunction(stmt) => {
+            Value::BoreFunction { stmt, enclosing: _ } => {
                 match stmt.statement_type {
                     StatementType::FunctionDeclaration { name: _, ref params, body: _, ref rtn} => {
                         let mut param_rules = Vec::new();
@@ -131,7 +133,7 @@ impl Value {
                             returns: Box::new(ret_type.clone()),
                         }
                     },
-                    Value::BoreFunction( stmt ) => {
+                    Value::BoreFunction { stmt, enclosing: _ } => {
                         match stmt.statement_type {
                             StatementType::FunctionDeclaration { name: _, ref params, body: _, ref rtn} => {
                                 let mut param_rules = Vec::new();
@@ -333,7 +335,8 @@ impl Interpreter {
         }
     }
     pub fn run(&mut self) -> Result<(), RuntimeError> {
-        let mut global_env = Environment::new(None);
+        let global_env = Environment::new(None);
+        let global_rc = Rc::new(RefCell::new(global_env));
         // built-ins module
         let builtins = builtins::init_module();
         if let Value::Object { fields, .. } = &builtins.obj {
@@ -341,16 +344,20 @@ impl Interpreter {
                 let var = Variable {
                     is_mutable: false,
                     ty: Type::Any,
-                    value: value.clone(),
+                    value: value.value.clone(),
                 };
-                let v = global_env.define(name, var);
+                let mut borrow = global_rc.borrow_mut();
+                let v = borrow.define(name, var);
                 self.comply_def_err(v, 1, 0)?;
             }
         }
         // pre-register of all functions
         for stmt in self.ast.iter() {
             if let StatementType::FunctionDeclaration { ref name, ref params, body: _, ref rtn } = stmt.statement_type {
-                let func_v = Value::BoreFunction(Rc::new(stmt.clone()));
+                let func_v = Value::BoreFunction {
+                    stmt: Rc::new(stmt.clone()),
+                    enclosing: global_rc.clone() as Env,
+                };
                 let mut param_rules = Vec::new();
                 for (_, ty, _) in params {
                     param_rules.push(ty.clone());
@@ -363,17 +370,16 @@ impl Interpreter {
                     },
                     value: func_v,
                 };
-                let v = global_env.define(name, var);
+                let mut borrow = global_rc.borrow_mut();
+                let v = borrow.define(name, var);
                 self.comply_def_err(v, stmt.line, stmt.column)?;
             }
         }
         // vtables
         primitive::register(&mut self.vtables);
-
-        let rc = Rc::new(RefCell::new(global_env));
         for i in 0..self.ast.len() {
             let stmt = self.ast[i].clone();
-            if let Err(e) = self.run_statement(&stmt, &rc) {
+            if let Err(e) = self.run_statement(&stmt, &global_rc) {
                 return Err(e);
             }
         }
@@ -512,7 +518,8 @@ impl Interpreter {
                         (Value::Str(l), Value::Str(r)) => Ok(Value::Bool(l == r)),
                         (Value::RustFunction { func: l, .. }, Value::RustFunction { func: r, .. }) =>
                             Ok(Value::Bool(std::ptr::fn_addr_eq(l, r))),
-                        (Value::BoreFunction(l), Value::BoreFunction(r)) => Ok(Value::Bool(std::ptr::eq(&l, &r))),
+                        (Value::BoreFunction { stmt: l, .. }, Value::BoreFunction { stmt: r, .. }) =>
+                            Ok(Value::Bool(std::ptr::eq(&l, &r))),
                         (l_val, r_val) => Err(RuntimeError {
                             error_type: RuntimeErrorType::Incompatible(l_val, r_val),
                             line: right.line,
@@ -525,7 +532,8 @@ impl Interpreter {
                         (Value::Str(l), Value::Str(r)) => Ok(Value::Bool(l != r)),
                         (Value::RustFunction { func: l, .. }, Value::RustFunction { func: r, .. }) =>
                             Ok(Value::Bool(!std::ptr::fn_addr_eq(l, r))),
-                        (Value::BoreFunction(l), Value::BoreFunction(r)) => Ok(Value::Bool(!std::ptr::eq(&l, &r))),
+                        (Value::BoreFunction { stmt: l, .. }, Value::BoreFunction { stmt: r, .. }) =>
+                            Ok(Value::Bool(!std::ptr::eq(&l, &r))),
                         (l_val, r_val) => Err(RuntimeError {
                             error_type: RuntimeErrorType::Incompatible(l_val, r_val),
                             line: right.line,
@@ -591,9 +599,9 @@ impl Interpreter {
                 }
             },
             ExpressionType::Assignment { ref target, ref op,  ref value } => {
+                let val = self.evaluate_expression(value, env)?;
+                let var_v = self.evaluate_expression(target, env)?;
                 if let ExpressionType::Identifier(ref str) = target.expression_type {
-                    let val = self.evaluate_expression(value, env)?;
-                    let var_v = self.evaluate_expression(target, env)?;
                     let mut borrow = env.borrow_mut();
                     match op.token_data {
                         TokenData::Equal => {
@@ -679,10 +687,111 @@ impl Interpreter {
                         }
                         _ => {}
                     }
-                    Ok(Value::Null)
-                } else {
-                    todo!("Prop. access for assignments")
+                    return Ok(Value::Null);
+                } else if let ExpressionType::PropertyAccess { object, property } = &target.expression_type {
+                    let obj = self.evaluate_expression(object, env)?;
+                    if let Value::Object { name, fields } = obj {
+                        let mut borrow = fields.borrow_mut();
+                        let field = borrow
+                            .get_mut(property)
+                            .ok_or_else(|| RuntimeError {
+                                error_type: RuntimeErrorType::PropertyNotFound(),
+                                line: object.line,
+                                column: object.column + 2,
+                            })?;
+                        if !field.is_mutable {
+                            return Err(RuntimeError {
+                                error_type: RuntimeErrorType::AttemptToChangeConstantField(name),
+                                line: object.line,
+                                column: object.column + 2,
+                            })
+                        }
+                        match op.token_data {
+                            TokenData::Equal => {
+                                field.value = val;
+                            },
+                            TokenData::AddAssign => {
+                                match (var_v, val) {
+                                    (Value::Int(var), Value::Int(targ)) =>
+                                        field.value = Value::Int(var + targ),
+                                    (Value::Str(var), Value::Str(targ)) =>
+                                        field.value = Value::Str(Rc::new(format!("{}{}", var, targ))),
+                                    (Value::Float(var), Value::Float(targ)) =>
+                                        field.value = Value::Float(var + targ),
+                                    (Value::Int(var), Value::Float(targ)) =>
+                                        field.value = Value::Int(var + targ as i64),
+                                    (Value::Float(var), Value::Int(targ)) =>
+                                        field.value = Value::Float(var + targ as f64),
+                                    (var, _targ) => return Err(RuntimeError {
+                                        error_type: RuntimeErrorType::CannotOperateOnType("+=".to_string(), format!("{} (value: {:?})", property, var)),
+                                        line: op.line,
+                                        column: op.column,
+                                    })
+                                }
+                            }
+                            TokenData::SubAssign => {
+                                match (var_v, val) {
+                                    (Value::Int(var), Value::Int(targ)) =>
+                                        field.value = Value::Int(var - targ),
+                                    (Value::Float(var), Value::Float(targ)) =>
+                                        field.value = Value::Float(var - targ),
+                                    (Value::Int(var), Value::Float(targ)) =>
+                                        field.value = Value::Int(var - targ as i64),
+                                    (Value::Float(var), Value::Int(targ)) =>
+                                        field.value = Value::Float(var - targ as f64),
+                                    (var, _targ) => return Err(RuntimeError {
+                                        error_type: RuntimeErrorType::CannotOperateOnType("-=".to_string(), format!("{} (value: {:?})", property, var)),
+                                        line: op.line,
+                                        column: op.column,
+                                    })
+                                }
+                            }
+                            TokenData::DivAssign => {
+                                match (var_v, val) {
+                                    (Value::Int(var), Value::Int(targ)) =>
+                                        field.value = Value::Int(var / targ),
+                                    (Value::Float(var), Value::Float(targ)) =>
+                                        field.value = Value::Float(var / targ ),
+                                    (Value::Int(var), Value::Float(targ)) =>
+                                        field.value = Value::Int(var / targ as i64),
+                                    (Value::Float(var), Value::Int(targ)) =>
+                                        field.value = Value::Float(var / targ as f64),
+                                    (var, _targ) => return Err(RuntimeError {
+                                        error_type: RuntimeErrorType::CannotOperateOnType("/=".to_string(), format!("{}(value: {:?})", property, var)),
+                                        line: op.line,
+                                        column: op.column,
+                                    })
+                                }
+                            },
+                            TokenData::MulAssign => {
+                                match (var_v, val) {
+                                    (Value::Int(var), Value::Int(targ)) =>
+                                        field.value = Value::Int(var * targ),
+                                    (Value::Float(var), Value::Float(targ)) =>
+                                        field.value = Value::Float(var * targ),
+                                    (Value::Int(var), Value::Float(targ)) =>
+                                        field.value = Value::Int(var * targ as i64),
+                                    (Value::Float(var), Value::Int(targ)) =>
+                                        field.value = Value::Float(var * targ as f64),
+                                    (Value::Str(var), Value::Int(targ)) => {
+                                        let mut full = String::new();
+                                        for _ in 0..targ {
+                                            full = format!("{}{}", full, var);
+                                        }
+                                        field.value = Value::Str(Rc::new(full));
+                                    }
+                                    (var, _targ) => return Err(RuntimeError {
+                                        error_type: RuntimeErrorType::CannotOperateOnType("*=".to_string(), format!("{}(value: {:?})", property, var)),
+                                        line: op.line,
+                                        column: op.column,
+                                    })
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
+                Ok(Value::Null)
             },
             ExpressionType::Integer(i) => Ok(Value::Int(i)),
             ExpressionType::Float(f) => Ok(Value::Float(f)),
@@ -762,7 +871,7 @@ impl Interpreter {
                     Value::Object{name: _, ref fields} => {
                         let borrow = fields.borrow();
                         if let Some(v) = borrow.get(property) {
-                            Ok(v.to_owned())
+                            Ok(v.value.to_owned())
                         } else {
                             Err(RuntimeError {
                                 error_type: RuntimeErrorType::PropertyNotFound(),
@@ -797,23 +906,27 @@ impl Interpreter {
                     arg_v.push(v);
                 }
                 match callee_v {
-                    Value::BoreFunction(func) => {
-                        let v = self.run_function(func, arg_v, env);
+                    Value::BoreFunction { stmt: func, enclosing } => {
+                        let v = self.run_function(func, arg_v, &enclosing);
                         v
                     },
                     Value::RustFunction { func, .. } => {
-                        Ok(func(arg_v))
+                        let v = func(arg_v)
+                            .map_err(|x| return RuntimeError { error_type: x, line: expression.line, column: expression.column });
+                        Ok(v?)
                     },
                     Value::BoundMethod { this, func } => {
                         arg_v.insert(0, *this);
                         match *func {
                             Value::RustFunction { func, .. } => {
-                                 Ok(func(arg_v))
+                                let v = func(arg_v)
+                                    .map_err(|x| return RuntimeError { error_type: x, line: expression.line, column: expression.column });
+                                Ok(v?)
                             }
-                            Value::BoreFunction(func) => {
-                                let v = self.run_function(func, arg_v, env);
+                            Value::BoreFunction { stmt: func, enclosing } => {
+                                let v = self.run_function(func, arg_v, &enclosing);
                                 v
-                            }
+                            },
                             _ => unreachable!()
                         }
                     },
@@ -833,7 +946,12 @@ impl Interpreter {
     }
 
     pub fn run_function(&mut self, fn_stmt: Rc<Statement>, args: Vec<Value>, prev_env: &Env) -> Result<Value, RuntimeError> {
-        let fn_env = Environment::new(Some(prev_env.clone()));
+        let fn_env;
+        if prev_env.borrow().enclosing.is_none() {
+            fn_env = Environment::new(Some(prev_env.clone()));
+        } else {
+            fn_env = Environment::new(prev_env.borrow().enclosing.clone());
+        }
         let fn_env_rc = Rc::new(RefCell::new(fn_env));
         match fn_stmt.statement_type {
             StatementType::FunctionDeclaration {ref name, ref params, ref body, ref rtn} => {
@@ -1033,5 +1151,92 @@ impl Interpreter {
                 line, column
             })
         }
+    }
+    pub fn eval_assign(&self, op: &Token, borrow: &mut Environment, str: &String, var_v: &Value, val: &Value, value: &Expression) -> Result<(), RuntimeError> {
+        match op.token_data {
+            TokenData::Equal => {
+                let v = borrow.set(str, val, true);
+                self.comply_def_err(v, value.line, value.column)?;
+            },
+            TokenData::AddAssign => {
+                let v;
+                match (var_v, val) {
+                    (Value::Int(var), Value::Int(targ)) =>
+                        v = borrow.set(str, &Value::Int(var + targ), true),
+                    (Value::Str(var), Value::Str(targ)) =>
+                        v = borrow.set(str, &Value::Str(Rc::new(format!("{}{}", var, targ))), true),
+                    (Value::Float(var), Value::Float(targ)) =>
+                        v = borrow.set(str, &Value::Float(var + targ), true),
+                    (Value::Int(var), Value::Float(targ)) =>
+                        v = borrow.set(str, &Value::Int(var + *targ as i64), true),
+                    (var, _targ) => return Err(RuntimeError {
+                        error_type: RuntimeErrorType::CannotOperateOnType("+=".to_string(), format!("{} (value: {:?})", str, var)),
+                        line: op.line,
+                        column: op.column,
+                    })
+                }
+                self.comply_def_err(v, value.line, value.column)?;
+            }
+            TokenData::SubAssign => {
+                let v;
+                match (var_v, val) {
+                    (Value::Int(var), Value::Int(targ)) =>
+                        v = borrow.set(str, &Value::Int(var - targ), true),
+                    (Value::Float(var), Value::Float(targ)) =>
+                        v = borrow.set(str, &Value::Float(var - targ), true),
+                    (Value::Int(var), Value::Float(targ)) =>
+                        v = borrow.set(str, &Value::Float((*var as f64) - targ), true),
+                    (var, _targ) => return Err(RuntimeError {
+                        error_type: RuntimeErrorType::CannotOperateOnType("-=".to_string(), format!("{} (value: {:?})", str, var)),
+                        line: op.line,
+                        column: op.column,
+                    })
+                }
+                self.comply_def_err(v, value.line, value.column)?;
+            }
+            TokenData::DivAssign => {
+                let v;
+                match (var_v, val) {
+                    (Value::Int(var), Value::Int(targ)) =>
+                        v = borrow.set(str, &Value::Int(var / targ), true),
+                    (Value::Float(var), Value::Float(targ)) =>
+                        v = borrow.set(str, &Value::Float(var / targ), true),
+                    (Value::Int(var), Value::Float(targ)) =>
+                        v = borrow.set(str, &Value::Float((*var as f64) / targ), true),
+                    (var, _targ) => return Err(RuntimeError {
+                        error_type: RuntimeErrorType::CannotOperateOnType("/=".to_string(), format!("{}(value: {:?})", str, var)),
+                        line: op.line,
+                        column: op.column,
+                    })
+                }
+                self.comply_def_err(v, value.line, value.column)?;
+            },
+            TokenData::MulAssign => {
+                let v;
+                match (var_v, val) {
+                    (Value::Int(var), Value::Int(targ)) =>
+                        v = borrow.set(str, &Value::Int(var * targ), true),
+                    (Value::Float(var), Value::Float(targ)) =>
+                        v = borrow.set(str, &Value::Float(var * targ), true),
+                    (Value::Int(var), Value::Float(targ)) =>
+                        v = borrow.set(str, &Value::Float((*var as f64) * targ), true),
+                    (Value::Str(var), Value::Int(targ)) => {
+                        let mut full = String::new();
+                        for _ in 0..*targ {
+                            full = format!("{}{}", full, var);
+                        }
+                        v = borrow.set(str, &Value::Str(Rc::new(full)), true);
+                    }
+                    (var, _targ) => return Err(RuntimeError {
+                        error_type: RuntimeErrorType::CannotOperateOnType("*=".to_string(), format!("{}(value: {:?})", str, var)),
+                        line: op.line,
+                        column: op.column,
+                    })
+                }
+                self.comply_def_err(v, value.line, value.column)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
